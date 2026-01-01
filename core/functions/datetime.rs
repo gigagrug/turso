@@ -2,18 +2,12 @@ use crate::types::AsValueRef;
 use crate::types::Value;
 use crate::LimboError::InvalidModifier;
 use crate::{Result, ValueRef};
+// chrono isn't used more due to incompatibility with sqlite
 use chrono::{Local, Offset, TimeZone};
 use std::fmt::Write;
 
 const JD_TO_MS: i64 = 86_400_000;
-const UNIX_EPOCH_JD: i64 = 21086676 * 10000; // 2440587.5 * 86400000
 const MAX_JD: i64 = 464269060799999; // 9999-12-31 23:59:59.999
-const LIMIT_SECOND: f64 = 4.6427e+14;
-const LIMIT_MINUTE: f64 = 7.7379e+12;
-const LIMIT_HOUR: f64 = 1.2897e+11;
-const LIMIT_DAY: f64 = 5373485.0;
-const LIMIT_MONTH: f64 = 176546.0;
-const LIMIT_YEAR: f64 = 14713.0;
 
 #[derive(Debug, Clone, Copy)]
 struct DateTime {
@@ -70,43 +64,36 @@ impl DateTime {
         if self.valid_jd {
             return;
         }
-
-        let (y_in, m_in, d_in) = if self.valid_ymd {
-            (self.y, self.m, self.d)
+        let mut y: i32;
+        let mut m: i32;
+        let d: i32;
+        if self.valid_ymd {
+            y = self.y;
+            m = self.m;
+            d = self.d;
         } else {
-            (2000, 1, 1)
-        };
-
-        if y_in < -4713 || y_in > 9999 || self.raw_s {
+            y = 2000;
+            m = 1;
+            d = 1;
+        }
+        if y < -4713 || y > 9999 || self.raw_s {
             self.set_error();
             return;
         }
-
-        let mut y = y_in;
-        let mut m = m_in;
-        let d = d_in;
-
         if m <= 2 {
             y -= 1;
             m += 12;
         }
-
         let a = (y + 4800) / 100;
         let b = 38 - a + (a / 4);
         let x1 = 36525 * (y + 4716) / 100;
         let x2 = 306001 * (m + 1) / 10000;
-
-        let day_part = (x1 + x2 + d + b - 1524) as i64;
-        let day_ms = day_part * JD_TO_MS - 43200000;
-
-        self.i_jd = day_ms;
-
+        self.i_jd = (x1 as i64 + x2 as i64 + d as i64 + b as i64) * 86400000 - 131716800000;
+        self.valid_jd = true;
         if self.valid_hms {
-            let h_ms = self.h as i64 * 3_600_000;
-            let m_ms = self.min as i64 * 60_000;
-            let s_ms = (self.s * 1000.0 + 0.5) as i64;
-            self.i_jd += h_ms + m_ms + s_ms;
-
+            self.i_jd += self.h as i64 * 3_600_000
+                + self.min as i64 * 60_000
+                + (self.s * 1000.0 + 0.5) as i64;
             if self.tz != 0 {
                 self.i_jd -= self.tz as i64 * 60_000;
                 self.valid_ymd = false;
@@ -116,8 +103,6 @@ impl DateTime {
                 self.is_local = false;
             }
         }
-
-        self.valid_jd = true;
     }
 
     fn compute_ymd(&mut self) {
@@ -149,21 +134,15 @@ impl DateTime {
     }
 
     fn compute_hms(&mut self) {
+        let day_ms: i32;
+        let day_min: i32;
         if self.valid_hms {
             return;
         }
         self.compute_jd();
-
-        let jd = self.i_jd + 43200000;
-        let day_ms = (jd % JD_TO_MS) as i32;
-        let day_ms = if day_ms < 0 {
-            day_ms + JD_TO_MS as i32
-        } else {
-            day_ms
-        };
-
+        day_ms = ((self.i_jd + 43200000) % 86400000) as i32;
         self.s = (day_ms % 60000) as f64 / 1000.0;
-        let day_min = day_ms / 60000;
+        day_min = day_ms / 60000;
         self.min = day_min % 60;
         self.h = day_min / 60;
         self.raw_s = false;
@@ -182,25 +161,49 @@ impl DateTime {
     }
 
     fn compute_floor(&mut self) {
-        if self.m > 12 || self.m < 1 || self.d > 31 || self.d < 1 {
-            return;
-        }
+        assert!(self.valid_ymd || self.is_error);
+        assert!(self.d >= 0 && self.d <= 31);
+        assert!(self.m >= 0 && self.m <= 12);
         if self.d <= 28 {
             self.n_floor = 0;
-            return;
-        }
-        if (0x15aa & (1 << self.m)) != 0 {
+        } else if ((1 << self.m) & 0x15aa) != 0 {
             self.n_floor = 0;
         } else if self.m != 2 {
             self.n_floor = if self.d == 31 { 1 } else { 0 };
+        } else if self.y % 4 != 0 || (self.y % 100 == 0 && self.y % 400 != 0) {
+            self.n_floor = self.d - 28;
         } else {
-            if is_leap(self.y) {
-                self.n_floor = self.d - 29;
-            } else {
-                self.n_floor = self.d - 28;
-            }
+            self.n_floor = self.d - 29;
         }
     }
+}
+
+fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32, &str)> {
+    if z.len() < digits {
+        return None;
+    }
+    let slice = &z[..digits];
+    if !slice.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let val = slice.parse::<i32>().ok()?;
+    if val < min_val || val > max_val {
+        return None;
+    }
+    Some((val, &z[digits..]))
+}
+
+fn set_to_current(p: &mut DateTime) {
+    let now = std::time::SystemTime::now();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    const UNIX_EPOCH_IJD: i64 = 210866760000000;
+    p.i_jd = UNIX_EPOCH_IJD + duration.as_millis() as i64;
+    p.valid_jd = true;
+    p.is_utc = true;
+    p.is_local = false;
+    p.clear_ymd_hms_tz();
 }
 
 fn parse_modifier_ymd(z: &str) -> Option<(i32, i32, i32)> {
@@ -214,7 +217,7 @@ fn parse_modifier_ymd(z: &str) -> Option<(i32, i32, i32)> {
     Some((y, m, d))
 }
 
-fn parse_date(value: &str, p: &mut DateTime) -> Result<()> {
+fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
     }
@@ -234,77 +237,72 @@ fn parse_date(value: &str, p: &mut DateTime) -> Result<()> {
         }
         return Ok(());
     }
+    if value.eq_ignore_ascii_case("subsec") || value.eq_ignore_ascii_case("subsecond") {
+        p.use_subsec = true;
+        set_to_current(p);
+        return Ok(());
+    }
     Err(crate::LimboError::InvalidModifier("Parse Failed".into()))
 }
 
-fn set_to_current(p: &mut DateTime) {
-    let now = std::time::SystemTime::now();
-    let duration = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    const UNIX_EPOCH_IJD: i64 = 210866760000000;
-    p.i_jd = UNIX_EPOCH_IJD + duration.as_millis() as i64;
-    p.valid_jd = true;
-    p.is_utc = true;
-    p.is_local = false;
-    p.clear_ymd_hms_tz();
-}
-
 fn parse_yyyy_mm_dd(mut z: &str, p: &mut DateTime) -> bool {
-    let neg = if z.starts_with('-') {
+    let y: i32;
+    let m: i32;
+    let d: i32;
+    let neg: bool;
+
+    if z.starts_with('-') {
         z = &z[1..];
-        true
+        neg = true;
     } else {
-        false
-    };
+        neg = false;
+    }
 
-    if z.len() < 10 || !z.as_bytes()[4].eq(&b'-') || !z.as_bytes()[7].eq(&b'-') {
+    if let Some((val, rem)) = get_digits(z, 4, 0, 9999) {
+        y = val;
+        z = rem;
+    } else {
         return false;
     }
 
-    let y = match z[0..4].parse::<i32>() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let m = match z[5..7].parse::<i32>() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let d = match z[8..10].parse::<i32>() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    if m < 1 || m > 12 {
+    if !z.starts_with('-') {
         return false;
     }
-    if d < 1 || d > 31 {
+    z = &z[1..];
+
+    if let Some((val, rem)) = get_digits(z, 2, 1, 12) {
+        m = val;
+        z = rem;
+    } else {
         return false;
     }
 
-    z = &z[10..];
+    if !z.starts_with('-') {
+        return false;
+    }
+    z = &z[1..];
 
-    if z.is_empty() {
+    if let Some((val, rem)) = get_digits(z, 2, 1, 31) {
+        d = val;
+        z = rem;
+    } else {
+        return false;
+    }
+
+    while !z.is_empty() {
+        let c = z.as_bytes()[0] as char;
+        if c.is_ascii_whitespace() || c == 'T' {
+            z = &z[1..];
+        } else {
+            break;
+        }
+    }
+
+    if parse_hh_mm_ss(z, p) {
+    } else if z.is_empty() {
         p.valid_hms = false;
     } else {
-        let first = z.chars().next().unwrap();
-        // SQLite Requirement: Separator must start with space or 'T'
-        if !first.is_whitespace() && first != 'T' && first != 't' {
-            return false;
-        }
-        let mut rest = z.trim_start();
-        if rest.starts_with('T') || rest.starts_with('t') {
-            rest = &rest[1..];
-        }
-        rest = rest.trim_start();
-
-        if !rest.is_empty() {
-            if !parse_hh_mm_ss(rest, p) {
-                return false;
-            }
-        } else {
-            p.valid_hms = false;
-        }
+        return false;
     }
 
     p.valid_jd = false;
@@ -322,162 +320,152 @@ fn parse_yyyy_mm_dd(mut z: &str, p: &mut DateTime) -> bool {
 }
 
 fn parse_hh_mm_ss(mut z: &str, p: &mut DateTime) -> bool {
-    z = z.trim();
-    if z.len() < 5 {
+    let h: i32;
+    let m: i32;
+    let mut s: i32 = 0;
+    let mut ms: f64 = 0.0;
+
+    if let Some((val, rem)) = get_digits(z, 2, 0, 24) {
+        h = val;
+        z = rem;
+    } else {
         return false;
     }
 
-    // Strict HH:MM check
-    if !z.as_bytes()[0].is_ascii_digit()
-        || !z.as_bytes()[1].is_ascii_digit()
-        || z.as_bytes()[2] != b':'
-        || !z.as_bytes()[3].is_ascii_digit()
-        || !z.as_bytes()[4].is_ascii_digit()
-    {
+    if !z.starts_with(':') {
+        return false;
+    }
+    z = &z[1..];
+
+    if let Some((val, rem)) = get_digits(z, 2, 0, 59) {
+        m = val;
+        z = rem;
+    } else {
         return false;
     }
 
-    let h = z[0..2].parse::<i32>().unwrap_or(0);
-    let m = z[3..5].parse::<i32>().unwrap_or(0);
-    let mut s = 0.0;
-
-    z = &z[5..];
-
-    // Optional :SS.FFF
     if z.starts_with(':') {
-        // Must have at least :SS (3 chars)
-        if z.len() < 3 {
-            return false;
-        }
         z = &z[1..];
 
-        // Seconds must be exactly 2 digits
-        if !z.as_bytes()[0].is_ascii_digit() || !z.as_bytes()[1].is_ascii_digit() {
+        if let Some((val, rem)) = get_digits(z, 2, 0, 59) {
+            s = val;
+            z = rem;
+        } else {
             return false;
         }
 
-        let s_int = z[0..2].parse::<f64>().unwrap_or(0.0);
-        let mut s_frac = 0.0;
+        if z.starts_with('.') && z.len() > 1 && z.as_bytes()[1].is_ascii_digit() {
+            let mut r_scale = 1.0;
+            z = &z[1..]; // Skip '.'
 
-        let mut end = 2; // consume 2 digits for seconds
+            while !z.is_empty() && z.as_bytes()[0].is_ascii_digit() {
+                let digit = (z.as_bytes()[0] - b'0') as f64;
+                ms = ms * 10.0 + digit;
+                r_scale *= 10.0;
+                z = &z[1..];
+            }
+            ms /= r_scale;
 
-        // Optional fractional part
-        if end < z.len() && z.as_bytes()[end] == b'.' {
-            // Must have digit after dot to consume it as part of seconds
-            if end + 1 < z.len() && z.as_bytes()[end + 1].is_ascii_digit() {
-                let frac_start = end;
-                end += 1;
-                while end < z.len() && z.as_bytes()[end].is_ascii_digit() {
-                    end += 1;
-                }
-                s_frac = z[frac_start..end].parse::<f64>().unwrap_or(0.0);
-
-                // SQLite logic: Truncate to avoid sub-millisecond rounding issues
-                if s_frac > 0.999 {
-                    s_frac = 0.999;
-                }
+            if ms > 0.999 {
+                ms = 0.999;
             }
         }
-
-        s = s_int + s_frac;
-        z = &z[end..];
+    } else {
+        s = 0;
     }
 
-    if h > 24 || m > 59 || s >= 60.0 {
-        return false;
-    }
-
+    p.valid_jd = false;
+    p.raw_s = false;
+    p.valid_hms = true;
     p.h = h;
     p.min = m;
-    p.s = s;
-    p.valid_hms = true;
+    p.s = s as f64 + ms;
 
-    // Check timezone. parse_timezone returns true on error.
     if parse_timezone(z, p) {
         return false;
     }
-
     true
 }
 
 fn parse_timezone(mut z: &str, p: &mut DateTime) -> bool {
-    z = z.trim_start();
+    while !z.is_empty() {
+        let c = z.as_bytes()[0] as char;
+        if c.is_ascii_whitespace() {
+            z = &z[1..];
+        } else {
+            break;
+        }
+    }
+
     p.tz = 0;
 
     if z.is_empty() {
         return false;
     }
 
-    let c = z.chars().next().unwrap();
-    let sgn = if c == '-' {
-        -1
+    let c = z.as_bytes()[0] as char;
+    let sgn: i32;
+
+    if c == '-' {
+        sgn = -1;
     } else if c == '+' {
-        1
+        sgn = 1;
     } else if c == 'Z' || c == 'z' {
         z = &z[1..];
-        // SQLite checks for trailing garbage after 'Z'
-        z = z.trim_start();
-        if !z.is_empty() {
-            return true; // Error: trailing characters
-        }
-        p.is_utc = true;
         p.is_local = false;
-        return false;
+        p.is_utc = true;
+        return check_trailing_garbage(z);
     } else {
-        // Characters remaining that are not a timezone indicator (+/-/Z)
-        // imply invalid garbage at the end of the date string.
         return true;
-    };
+    }
 
-    // We have +/-. Advance past sign.
     z = &z[1..];
 
-    // SQLite requires strict HH:MM format (5 chars)
-    if z.len() < 5 {
+    let n_hr: i32;
+    if let Some((val, rem)) = get_digits(z, 2, 0, 14) {
+        n_hr = val;
+        z = rem;
+    } else {
         return true;
     }
 
-    // Parse HH
-    if !z.as_bytes()[0].is_ascii_digit() || !z.as_bytes()[1].is_ascii_digit() {
+    if !z.starts_with(':') {
         return true;
     }
-    let h: i32 = z[0..2].parse().unwrap_or(0);
+    z = &z[1..];
 
-    // SQLite '20b' specifier limits Hours to 14
-    if h > 14 {
-        return true;
-    }
-
-    // Expect ':' separator
-    if z.as_bytes()[2] != b':' {
+    let n_mn: i32;
+    if let Some((val, rem)) = get_digits(z, 2, 0, 59) {
+        n_mn = val;
+        z = rem;
+    } else {
         return true;
     }
 
-    // Parse MM
-    if !z.as_bytes()[3].is_ascii_digit() || !z.as_bytes()[4].is_ascii_digit() {
-        return true;
-    }
-    let m: i32 = z[3..5].parse().unwrap_or(0);
+    p.tz = sgn * (n_mn + n_hr * 60);
 
-    if m > 59 {
-        return true;
-    }
-
-    z = &z[5..];
-
-    p.tz = sgn * (h * 60 + m);
     if p.tz == 0 {
-        p.is_utc = true;
         p.is_local = false;
+        p.is_utc = true;
     }
 
-    // Check for trailing garbage after HH:MM
-    z = z.trim_start();
-    if !z.is_empty() {
-        return true;
-    }
+    check_trailing_garbage(z)
+}
 
-    false
+// Helper to mimic the "zulu_time" label logic:
+// while( sqlite3Isspace(*zDate) ){ zDate++; }
+// return *zDate!=0;
+fn check_trailing_garbage(mut z: &str) -> bool {
+    while !z.is_empty() {
+        let c = z.as_bytes()[0] as char;
+        if c.is_ascii_whitespace() {
+            z = &z[1..];
+        } else {
+            break;
+        }
+    }
+    // Return true if garbage remains (Error), false if empty (Success)
+    !z.is_empty()
 }
 
 fn auto_adjust_date(p: &mut DateTime) {
@@ -492,11 +480,17 @@ fn auto_adjust_date(p: &mut DateTime) {
     }
 }
 
-fn apply_modifier(p: &mut DateTime, z: &str) -> Result<()> {
+fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
     let z_lower = z.to_lowercase();
 
     match z_lower.chars().next() {
         Some('a') if z_lower == "auto" => {
+            if idx > 0 {
+                return Err(InvalidModifier(format!(
+                    "Modifier 'auto' must be first: {}",
+                    z
+                )));
+            }
             auto_adjust_date(p);
             Ok(())
         }
@@ -516,6 +510,12 @@ fn apply_modifier(p: &mut DateTime, z: &str) -> Result<()> {
             Ok(())
         }
         Some('j') if z_lower == "julianday" => {
+            if idx > 0 {
+                return Err(InvalidModifier(format!(
+                    "Modifier 'julianday' must be first: {}",
+                    z
+                )));
+            }
             if p.valid_jd && p.raw_s {
                 p.raw_s = false;
                 Ok(())
@@ -542,6 +542,12 @@ fn apply_modifier(p: &mut DateTime, z: &str) -> Result<()> {
             Ok(())
         }
         Some('u') if z_lower == "unixepoch" => {
+            if idx > 0 {
+                return Err(InvalidModifier(format!(
+                    "Modifier 'unixepoch' must be first: {}",
+                    z
+                )));
+            }
             if p.raw_s {
                 let r = p.s * 1000.0 + 210866760000000.0;
                 p.i_jd = (r + 0.5) as i64;
@@ -621,12 +627,13 @@ fn apply_modifier(p: &mut DateTime, z: &str) -> Result<()> {
         _ => Err(InvalidModifier(format!("Unknown modifier: {}", z))),
     }
 }
+
 fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     let z = z.trim();
     let is_neg = z.starts_with('-');
     let sign = if is_neg { -1 } else { 1 };
 
-    let mut clean_z = if z.starts_with('+') || z.starts_with('-') {
+    let clean_z = if z.starts_with('+') || z.starts_with('-') {
         &z[1..]
     } else {
         z
@@ -713,10 +720,10 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
             match unit.as_str() {
                 "day" | "days" | "hour" | "hours" | "minute" | "minutes" | "second" | "seconds" => {
                     let limit = match unit.as_str() {
-                        "day" | "days" => LIMIT_DAY,
-                        "hour" | "hours" => LIMIT_HOUR,
-                        "minute" | "minutes" => LIMIT_MINUTE,
-                        "second" | "seconds" => LIMIT_SECOND,
+                        "day" | "days" => 5373485.0,
+                        "hour" | "hours" => 1.2897e+11,
+                        "minute" | "minutes" => 7.7379e+12,
+                        "second" | "seconds" => 4.6427e+14,
                         _ => 0.0,
                     };
                     if !limit_check(val, limit) {
@@ -738,7 +745,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                     return Ok(());
                 }
                 "month" | "months" => {
-                    if !limit_check(val, LIMIT_MONTH) {
+                    if !limit_check(val, 176546.0) {
                         return Err(InvalidModifier(format!("Modifier out of range: {}", z)));
                     }
                     p.compute_ymd_hms();
@@ -767,7 +774,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                     return Ok(());
                 }
                 "year" | "years" => {
-                    if !limit_check(val, LIMIT_YEAR) {
+                    if !limit_check(val, 14713.0) {
                         return Err(InvalidModifier(format!("Modifier out of range: {}", z)));
                     }
                     p.compute_ymd_hms();
@@ -799,8 +806,127 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     )))
 }
 
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
+    let mut p = DateTime::default();
+    let mut has_modifier = false;
+
+    if values.len() == 0 {
+        set_to_current(&mut p);
+    } else {
+        let first = values.next().unwrap();
+        match first.as_value_ref() {
+            ValueRef::Text(s) => {
+                if parse_date_or_time(s.as_str(), &mut p).is_err() {
+                    return Value::Null;
+                }
+            }
+            ValueRef::Integer(i) => {
+                p.s = i as f64;
+                p.raw_s = true;
+                if p.s >= 0.0 && p.s < 5373484.5 {
+                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
+                    p.valid_jd = true;
+                }
+            }
+            ValueRef::Float(f) => {
+                p.s = f;
+                p.raw_s = true;
+                if p.s >= 0.0 && p.s < 5373484.5 {
+                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
+                    p.valid_jd = true;
+                }
+            }
+            _ => return Value::Null,
+        }
+    }
+
+    for (i, val) in values.enumerate() {
+        has_modifier = true;
+        if let ValueRef::Text(s) = val.as_value_ref() {
+            if parse_modifier(&mut p, s.as_str(), i).is_err() {
+                return Value::Null;
+            }
+        } else {
+            return Value::Null;
+        }
+    }
+
+    p.compute_jd();
+    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
+        return Value::Null;
+    }
+
+    if !has_modifier && p.valid_ymd && p.d > 28 {
+        p.valid_ymd = false;
+    }
+
+    match func_type {
+        "julianday" => Value::Float(p.i_jd as f64 / 86400000.0),
+        "unixepoch" => {
+            let unix = (p.i_jd - 210866760000000) / 1000;
+            if p.use_subsec {
+                let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
+                Value::Float(ms)
+            } else {
+                Value::Integer(unix)
+            }
+        }
+        _ => {
+            p.compute_ymd_hms();
+            if p.is_error {
+                return Value::Null;
+            }
+
+            let mut res = String::new();
+            if func_type == "date" {
+                if p.y < 0 {
+                    write!(res, "-{:04}-{:02}-{:02}", p.y.abs(), p.m, p.d).unwrap();
+                } else {
+                    write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
+                }
+            } else if func_type == "time" {
+                write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
+                if p.use_subsec {
+                    write!(res, ":{:06.3}", p.s).unwrap();
+                } else {
+                    write!(res, ":{:02}", p.s as i32).unwrap();
+                }
+            } else {
+                if p.y < 0 {
+                    write!(
+                        res,
+                        "-{:04}-{:02}-{:02} {:02}:{:02}",
+                        p.y.abs(),
+                        p.m,
+                        p.d,
+                        p.h,
+                        p.min
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        res,
+                        "{:04}-{:02}-{:02} {:02}:{:02}",
+                        p.y, p.m, p.d, p.h, p.min
+                    )
+                    .unwrap();
+                }
+
+                if p.use_subsec {
+                    write!(res, ":{:06.3}", p.s).unwrap();
+                } else {
+                    write!(res, ":{:02}", p.s as i32).unwrap();
+                }
+            }
+            Value::from_text(res)
+        }
+    }
 }
 
 pub fn exec_date<I, E, V>(values: I) -> Value
@@ -848,111 +974,6 @@ where
     exec_datetime_general(values, "unixepoch")
 }
 
-pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut values = values.into_iter();
-    let mut p = DateTime::default();
-    let mut has_modifier = false;
-
-    if values.len() == 0 {
-        set_to_current(&mut p);
-    } else {
-        let first = values.next().unwrap();
-        match first.as_value_ref() {
-            ValueRef::Text(s) => {
-                if parse_date(s.as_str(), &mut p).is_err() {
-                    return Value::Null;
-                }
-            }
-            ValueRef::Integer(i) => {
-                p.s = i as f64;
-                p.raw_s = true;
-                if p.s >= 0.0 && p.s < 5373484.5 {
-                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
-                    p.valid_jd = true;
-                }
-            }
-            ValueRef::Float(f) => {
-                p.s = f;
-                p.raw_s = true;
-                if p.s >= 0.0 && p.s < 5373484.5 {
-                    p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
-                    p.valid_jd = true;
-                }
-            }
-            _ => return Value::Null,
-        }
-    }
-
-    for val in values {
-        has_modifier = true;
-        if let ValueRef::Text(s) = val.as_value_ref() {
-            if apply_modifier(&mut p, s.as_str()).is_err() {
-                return Value::Null;
-            }
-        } else {
-            return Value::Null;
-        }
-    }
-
-    p.compute_jd();
-    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
-        return Value::Null;
-    }
-
-    if !has_modifier && p.valid_ymd && p.d > 28 {
-        p.valid_ymd = false;
-    }
-
-    match func_type {
-        "julianday" => Value::Float(p.i_jd as f64 / 86400000.0),
-        "unixepoch" => {
-            let unix = (p.i_jd - 210866760000000) / 1000;
-            if p.use_subsec {
-                let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
-                Value::Float(ms)
-            } else {
-                Value::Integer(unix)
-            }
-        }
-        _ => {
-            p.compute_ymd_hms();
-            if p.is_error {
-                return Value::Null;
-            }
-
-            let mut res = String::new();
-            if func_type == "date" {
-                write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
-            } else if func_type == "time" {
-                write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
-            } else {
-                write!(
-                    res,
-                    "{:04}-{:02}-{:02} {:02}:{:02}",
-                    p.y, p.m, p.d, p.h, p.min
-                )
-                .unwrap();
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
-            }
-            Value::from_text(res)
-        }
-    }
-}
-
 pub fn exec_timediff<I, E, V>(values: I) -> Value
 where
     V: AsValueRef,
@@ -967,24 +988,67 @@ where
     let mut d1 = DateTime::default();
     let mut d2 = DateTime::default();
 
-    if let ValueRef::Text(s) = values.next().unwrap().as_value_ref() {
-        if parse_date(s.as_str(), &mut d1).is_err() {
-            return Value::Null;
+    // Parse first argument (d1)
+    let val1 = values.next().unwrap();
+    match val1.as_value_ref() {
+        ValueRef::Text(s) => {
+            if parse_date_or_time(s.as_str(), &mut d1).is_err() {
+                return Value::Null;
+            }
         }
-    } else {
-        return Value::Null;
+        ValueRef::Integer(i) => {
+            d1.s = i as f64;
+            d1.raw_s = true;
+            if d1.s >= 0.0 && d1.s < 5373484.5 {
+                d1.i_jd = (d1.s * JD_TO_MS as f64 + 0.5) as i64;
+                d1.valid_jd = true;
+            }
+        }
+        ValueRef::Float(f) => {
+            d1.s = f;
+            d1.raw_s = true;
+            if d1.s >= 0.0 && d1.s < 5373484.5 {
+                d1.i_jd = (d1.s * JD_TO_MS as f64 + 0.5) as i64;
+                d1.valid_jd = true;
+            }
+        }
+        _ => return Value::Null,
     }
 
-    if let ValueRef::Text(s) = values.next().unwrap().as_value_ref() {
-        if parse_date(s.as_str(), &mut d2).is_err() {
-            return Value::Null;
+    // Parse second argument (d2)
+    let val2 = values.next().unwrap();
+    match val2.as_value_ref() {
+        ValueRef::Text(s) => {
+            if parse_date_or_time(s.as_str(), &mut d2).is_err() {
+                return Value::Null;
+            }
         }
-    } else {
-        return Value::Null;
+        ValueRef::Integer(i) => {
+            d2.s = i as f64;
+            d2.raw_s = true;
+            if d2.s >= 0.0 && d2.s < 5373484.5 {
+                d2.i_jd = (d2.s * JD_TO_MS as f64 + 0.5) as i64;
+                d2.valid_jd = true;
+            }
+        }
+        ValueRef::Float(f) => {
+            d2.s = f;
+            d2.raw_s = true;
+            if d2.s >= 0.0 && d2.s < 5373484.5 {
+                d2.i_jd = (d2.s * JD_TO_MS as f64 + 0.5) as i64;
+                d2.valid_jd = true;
+            }
+        }
+        _ => return Value::Null,
     }
 
     d1.compute_jd();
     d2.compute_jd();
+
+    // Validate inputs after computation
+    if d1.is_error || d2.is_error {
+        return Value::Null;
+    }
 
     d1.compute_ymd_hms();
     d2.compute_ymd_hms();
@@ -1100,7 +1164,7 @@ where
                     }
                 } else {
                     let mut temp_p = DateTime::default();
-                    if parse_date(s_str, &mut temp_p).is_ok() {
+                    if parse_date_or_time(s_str, &mut temp_p).is_ok() {
                         p = temp_p;
                     } else {
                         return Value::Null;
@@ -1126,9 +1190,9 @@ where
             _ => return Value::Null,
         }
 
-        for val in values {
+        for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = val.as_value_ref() {
-                if apply_modifier(&mut p, s.as_str()).is_err() {
+                if parse_modifier(&mut p, s.as_str(), i).is_err() {
                     return Value::Null;
                 }
             } else {
